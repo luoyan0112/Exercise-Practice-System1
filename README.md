@@ -125,6 +125,15 @@ python main.py
 | `save_ai_diagnosis` | user_id, question_id, user_answer, diagnosis | int | 保存结构化诊断并返回记录 ID |
 | `get_ai_diagnoses` | user_id, question_id, limit | `list[dict]` | 查询历史错因诊断 |
 
+##### AI 资料题库模块
+
+| 函数 | 参数 | 返回值 | 说明 |
+|------|------|--------|------|
+| `save_ai_material_generation` | user_id, subject, filename, content, generated | int | 将资料总结和生成题原子保存到独立题库 |
+| `get_ai_materials` | user_id, subject, limit | `list[dict]` | 获取资料题库列表 |
+| `get_ai_material` | material_id, user_id | dict/None | 获取资料、知识点和生成题 |
+| `delete_ai_material` | material_id, user_id | bool | 级联删除资料及其生成题 |
+
 ##### 笔记模块
 | 函数 | 参数 | 返回值 | 说明 |
 |------|------|--------|------|
@@ -162,6 +171,9 @@ python main.py
 | POST/PUT/DELETE | `/api/notebook-pages` | 笔记本页面 CRUD |
 | POST | `/api/ai/diagnose` | 分析客观题错因并持久化 |
 | GET | `/api/ai/diagnoses` | 查询用户历史错因诊断 |
+| POST | `/api/ai/materials/generate` | 分析资料、总结知识点并生成题目 |
+| GET | `/api/ai/materials` | 获取独立资料题库列表 |
+| GET/DELETE | `/api/ai/materials/{id}` | 查看或删除一份资料题库 |
 
 ---
 
@@ -196,6 +208,14 @@ DrawingCanvas                # 画笔标注（自由缩放，支持撤销/重做
 NotebookWindow               # 共享笔记本（翻页，画笔标注）
 MainApplication              # 主窗口（Tab 容器）
 ```
+
+#### material_panel.py — AI 资料题库
+
+支持导入 `.txt`、`.md`、`.pdf`、`.docx`、`.csv`、`.json`、`.html` 等资料。
+程序在本地提取文字；短资料直接总结出题，长资料先分段提炼再综合生成。扫描版 PDF
+如果没有文本层，需要先用 OCR 软件转换。生成结果保存到独立表，不会混入正式 `questions` 题库。
+
+功能包括：资料列表、内容总结、核心知识点、生成题详情、单题练习、查看提取原文和级联删除。
 
 ##### 刷题流程
 
@@ -263,7 +283,7 @@ _save:
 
 建表 + 索引 + 触发器 + CET-6 示例数据。`--force` 参数可先删表重建。
 
-**11 张表：** `dict_question_types`, `subjects`, `knowledge_points`, `users`, `questions`, `question_knowledge`, `practice_records`, `answer_records`, `user_notes`, `user_knowledge_progress`, `ai_diagnoses`
+**13 张表：** 原有业务表以及 `ai_diagnoses`、`ai_materials`、`ai_generated_questions`。后两张表构成独立的 AI 资料题库。
 
 **示例数据：** 2 篇写作、1 篇仔细阅读（4 选择）、1 篇选词填空（10 空）、1 篇长篇阅读（5 匹配）、2 道翻译
 
@@ -285,6 +305,7 @@ users ──┬── user_notes
         ├── practice_records
         ├── answer_records
         ├── ai_diagnoses
+        ├── ai_materials ── ai_generated_questions
         └── user_knowledge_progress ──┬── knowledge_points
 ```
 
@@ -319,6 +340,10 @@ python main.py
 | 题目显示/批改逻辑 | `frontend/gui.py` → `PracticePanel._show_current_question`, `_submit_answer` |
 | AI 错因诊断界面 | `frontend/gui.py` → `PracticePanel._start_ai_diagnosis`, `_render_ai_diagnosis` |
 | AI 错因诊断接口 | `backend/server.py` → `ai_diagnose`; `backend/db.py` → `save_ai_diagnosis` |
+| 资料文件解析 | `frontend/document_reader.py` → `read_document` |
+| AI 资料题库界面 | `frontend/material_panel.py` → `AIMaterialPanel`, `AIMaterialDetailWindow` |
+| AI 资料生成接口 | `backend/server.py` → `generate_material_bank` |
+| AI 独立题库存储 | `backend/db.py` → `save_ai_material_generation`, `get_ai_materials` |
 | 复合题子题分组 | `frontend/gui.py` → `PracticePanel._build_question_list` |
 | 子题翻页 | `frontend/gui.py` → `PracticePanel._next_question` |
 | 截图选区 | `frontend/gui.py` → `ScreenshotSelector` |

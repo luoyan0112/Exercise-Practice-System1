@@ -363,6 +363,191 @@ def get_ai_diagnoses(user_id, question_id=None, limit=20):
         conn.close()
 
 
+# ==================== AI 资料题库模块 ====================
+
+def ensure_ai_material_tables():
+    """为新旧数据库创建独立的 AI 资料题库。"""
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS ai_materials (
+                id BIGSERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                subject_id INTEGER REFERENCES subjects(id) ON DELETE SET NULL,
+                title TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                file_type VARCHAR(16) NOT NULL,
+                source_content TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                knowledge_points JSONB NOT NULL DEFAULT '[]'::jsonb,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS ai_generated_questions (
+                id BIGSERIAL PRIMARY KEY,
+                material_id BIGINT NOT NULL REFERENCES ai_materials(id) ON DELETE CASCADE,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                subject_id INTEGER REFERENCES subjects(id) ON DELETE SET NULL,
+                type VARCHAR(32) NOT NULL,
+                content TEXT NOT NULL,
+                options JSONB,
+                answer TEXT NOT NULL,
+                explanation TEXT NOT NULL DEFAULT '',
+                difficulty SMALLINT NOT NULL DEFAULT 3 CHECK (difficulty BETWEEN 1 AND 5),
+                score FLOAT NOT NULL DEFAULT 1,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_ai_materials_user
+            ON ai_materials(user_id, created_at DESC)
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_ai_generated_material
+            ON ai_generated_questions(material_id, id)
+        """)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+
+def save_ai_material_generation(user_id, subject_name, filename, file_type,
+                                source_content, generated):
+    """在独立题库中原子保存资料、总结、知识点和生成题。"""
+    ensure_ai_material_tables()
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT id FROM subjects WHERE name = %s", (subject_name,))
+        row = cur.fetchone()
+        subject_id = row[0] if row else None
+        cur.execute("""
+            INSERT INTO ai_materials (
+                user_id, subject_id, title, filename, file_type,
+                source_content, summary, knowledge_points
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
+        """, (
+            user_id, subject_id, generated.get('title') or filename,
+            filename, file_type, source_content, generated['summary'],
+            psycopg2.extras.Json(
+                generated.get('knowledge_points', []),
+                dumps=lambda value: json.dumps(value, ensure_ascii=False)
+            ),
+        ))
+        material_id = cur.fetchone()[0]
+        for question in generated.get('questions', []):
+            options = question.get('options')
+            cur.execute("""
+                INSERT INTO ai_generated_questions (
+                    material_id, user_id, subject_id, type, content, options,
+                    answer, explanation, difficulty, score
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, (
+                material_id, user_id, subject_id, question['type'],
+                question['content'],
+                psycopg2.extras.Json(options, dumps=lambda value: json.dumps(value, ensure_ascii=False))
+                if options else None,
+                question['answer'], question.get('explanation', ''),
+                question.get('difficulty', 3), question.get('score', 1),
+            ))
+        conn.commit()
+        return material_id
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+
+def get_ai_materials(user_id, subject_name=None, limit=50):
+    """列出独立资料题库，不返回大段原文。"""
+    ensure_ai_material_tables()
+    conn = get_conn()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+    try:
+        where = ['m.user_id = %s']
+        params = [user_id]
+        if subject_name:
+            where.append('s.name = %s')
+            params.append(subject_name)
+        params.append(max(1, min(int(limit), 100)))
+        cur.execute(f"""
+            SELECT m.id, m.title, m.filename, m.file_type, m.summary,
+                   m.knowledge_points, m.created_at, s.name AS subject_name,
+                   COUNT(q.id) AS question_count
+            FROM ai_materials m
+            LEFT JOIN subjects s ON s.id = m.subject_id
+            LEFT JOIN ai_generated_questions q ON q.material_id = m.id
+            WHERE {' AND '.join(where)}
+            GROUP BY m.id, s.name
+            ORDER BY m.created_at DESC
+            LIMIT %s
+        """, params)
+        return [dict(row) for row in cur.fetchall()]
+    finally:
+        cur.close()
+        conn.close()
+
+
+def get_ai_material(material_id, user_id):
+    """获取一份资料及其独立生成题。"""
+    ensure_ai_material_tables()
+    conn = get_conn()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+    try:
+        cur.execute("""
+            SELECT m.*, s.name AS subject_name
+            FROM ai_materials m
+            LEFT JOIN subjects s ON s.id = m.subject_id
+            WHERE m.id = %s AND m.user_id = %s
+        """, (material_id, user_id))
+        material = cur.fetchone()
+        if not material:
+            return None
+        result = dict(material)
+        cur.execute("""
+            SELECT id, type, content, options, answer, explanation,
+                   difficulty, score, created_at
+            FROM ai_generated_questions
+            WHERE material_id = %s AND user_id = %s
+            ORDER BY id
+        """, (material_id, user_id))
+        result['questions'] = [dict(row) for row in cur.fetchall()]
+        return result
+    finally:
+        cur.close()
+        conn.close()
+
+
+def delete_ai_material(material_id, user_id):
+    """删除资料；生成题通过外键级联删除。"""
+    ensure_ai_material_tables()
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "DELETE FROM ai_materials WHERE id = %s AND user_id = %s",
+            (material_id, user_id)
+        )
+        deleted = cur.rowcount > 0
+        conn.commit()
+        return deleted
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+
 # ==================== 笔记模块 ====================
 
 def save_note(user_id, question_id, content, note_type='text', image_path=None):

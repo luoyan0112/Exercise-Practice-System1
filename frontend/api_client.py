@@ -181,6 +181,51 @@ def get_ai_diagnoses(user_id, question_id=None, limit=20):
         return []
 
 
+def generate_ai_material_bank(payload):
+    """分析资料并生成独立题库，返回 (material, error_message)。"""
+    try:
+        data = _post('/api/ai/materials/generate', _timeout=900, **payload)
+        if data.get('success'):
+            return data.get('material'), ''
+        return None, 'AI 未返回资料题库'
+    except Exception as e:
+        resp = getattr(e, 'response', None)
+        if resp is not None:
+            try:
+                return None, resp.json().get('detail', '资料生成失败')
+            except ValueError:
+                return None, '资料生成失败'
+        return None, f'连接资料生成服务失败: {e}'
+
+
+def get_ai_materials(user_id, subject=None, limit=50):
+    """获取用户的独立 AI 资料题库列表。"""
+    try:
+        params = {'user_id': user_id, 'limit': limit}
+        if subject:
+            params['subject'] = subject
+        return _get('/api/ai/materials', **params)
+    except Exception:
+        return []
+
+
+def get_ai_material(material_id, user_id):
+    """获取资料总结、知识点和生成题。"""
+    try:
+        return _get(f'/api/ai/materials/{material_id}', user_id=user_id)
+    except Exception:
+        return None
+
+
+def delete_ai_material(material_id, user_id):
+    """删除一份资料及其独立生成题。"""
+    try:
+        _delete(f'/api/ai/materials/{material_id}', user_id=user_id)
+        return True
+    except Exception:
+        return False
+
+
 # ==================== 题目模块 ====================
 
 

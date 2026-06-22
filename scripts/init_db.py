@@ -21,7 +21,8 @@ def drop_all_tables():
     cur.execute("SET session_replication_role = 'replica';")
 
     tables = [
-        'ai_diagnoses', 'user_knowledge_progress', 'user_notes', 'answer_records',
+        'ai_generated_questions', 'ai_materials', 'ai_diagnoses',
+        'user_knowledge_progress', 'user_notes', 'answer_records',
         'practice_records', 'question_knowledge', 'questions',
         'knowledge_points', 'users', 'subjects', 'dict_question_types'
     ]
@@ -190,6 +191,38 @@ def init_database():
     );
     """)
 
+    # ========== 13. AI 资料与独立生成题库 ==========
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS ai_materials (
+        id BIGSERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        subject_id INTEGER REFERENCES subjects(id) ON DELETE SET NULL,
+        title TEXT NOT NULL,
+        filename TEXT NOT NULL,
+        file_type VARCHAR(16) NOT NULL,
+        source_content TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        knowledge_points JSONB NOT NULL DEFAULT '[]'::jsonb,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS ai_generated_questions (
+        id BIGSERIAL PRIMARY KEY,
+        material_id BIGINT NOT NULL REFERENCES ai_materials(id) ON DELETE CASCADE,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        subject_id INTEGER REFERENCES subjects(id) ON DELETE SET NULL,
+        type VARCHAR(32) NOT NULL,
+        content TEXT NOT NULL,
+        options JSONB,
+        answer TEXT NOT NULL,
+        explanation TEXT NOT NULL DEFAULT '',
+        difficulty SMALLINT NOT NULL DEFAULT 3 CHECK (difficulty BETWEEN 1 AND 5),
+        score FLOAT NOT NULL DEFAULT 1,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    """)
+
     # ========== 索引 ==========
     cur.execute("CREATE INDEX IF NOT EXISTS idx_questions_parent_id ON questions(parent_id);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_questions_type ON questions(type);")
@@ -201,6 +234,8 @@ def init_database():
     cur.execute("CREATE INDEX IF NOT EXISTS idx_user_notes_user ON user_notes(user_id);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_ai_diagnoses_user ON ai_diagnoses(user_id, created_at DESC);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_ai_diagnoses_question ON ai_diagnoses(question_id, created_at DESC);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_ai_materials_user ON ai_materials(user_id, created_at DESC);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_ai_generated_material ON ai_generated_questions(material_id, id);")
 
     # ========== 自动更新时间触发器 ==========
     cur.execute("""

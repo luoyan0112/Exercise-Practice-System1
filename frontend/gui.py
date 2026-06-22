@@ -3401,6 +3401,17 @@ class MainApplication:
         self.notebook.add(nf, text='  笔记本  ')
         NotesPanel(nf, self.user, subject=self.current_subject)
 
+        # AI 资料题库（独立于正式 questions 题库）
+        af = tk.Frame(self.notebook, bg=COLOR_BG)
+        self.notebook.add(af, text='  AI资料题库  ')
+        from .material_panel import AIMaterialPanel
+        AIMaterialPanel(
+            af, self.user, self.current_subject,
+            on_practice=lambda question: AIPracticeDialog(
+                self.window, self.user, question
+            )
+        )
+
         # 数据分析
         sf = tk.Frame(self.notebook, bg=COLOR_BG)
         self.notebook.add(sf, text='  数据分析  ')

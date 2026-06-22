@@ -92,6 +92,16 @@ class AIDiagnoseReq(BaseModel):
     user_answer: str
     subject: str = ''
 
+class AIMaterialGenerateReq(BaseModel):
+    user_id: int
+    filename: str
+    file_type: str
+    content: str
+    subject: str = ''
+    question_type: str = 'mixed'
+    question_count: int = 5
+    difficulty: int = 3
+
 class NoteUpdateReq(BaseModel):
     user_id: int
     content: Optional[str] = None
@@ -480,6 +490,221 @@ def ai_diagnose(req: AIDiagnoseReq):
 def list_ai_diagnoses(user_id: int, question_id: Optional[int] = None,
                       limit: int = 20):
     return db_module.get_ai_diagnoses(user_id, question_id, limit)
+
+_MATERIAL_SYSTEM_PROMPT = """你是一名课程资料分析与命题专家。请根据提供的资料：
+1. 给出忠实、结构清晰的内容总结，不添加资料中没有的事实
+2. 提炼核心知识点，每个知识点包含 name 和 description
+3. 生成指定数量、题型和难度的练习题
+4. 选择题提供 A/B/C/D 四个选项，answer 只填选项字母
+5. 判断题用 A=正确、B=错误；填空题和简答题不提供 options
+6. 每道题必须给出答案和基于资料的解析
+7. 只返回一个 JSON 对象，格式为：
+{"title":"资料主题","summary":"总结","knowledge_points":[{"name":"知识点","description":"说明"}],"questions":[{"type":"choice","content":"题目","options":{"A":"...","B":"...","C":"...","D":"..."},"answer":"A","explanation":"解析","difficulty":3,"score":1}]}"""
+
+
+def _call_material_ai(system_prompt, user_prompt, max_tokens=4000, temperature=0.2):
+    resp = http_requests.post(DEEPSEEK_API_URL, json={
+        'model': 'deepseek-chat',
+        'messages': [
+            {'role': 'system', 'content': system_prompt},
+            {'role': 'user', 'content': user_prompt},
+        ],
+        'temperature': temperature,
+        'max_tokens': max_tokens,
+    }, headers={
+        'Authorization': f'Bearer {DEEPSEEK_API_KEY}',
+        'Content-Type': 'application/json',
+    }, timeout=90)
+    resp.raise_for_status()
+    return resp.json()['choices'][0]['message']['content']
+
+
+def _material_chunks(content, chunk_size=12000, max_chunks=6):
+    """按段落切分资料；超长内容均匀取样，避免只覆盖文件开头。"""
+    paragraphs = [part.strip() for part in content.split('\n\n') if part.strip()]
+    chunks = []
+    current = []
+    current_size = 0
+    for paragraph in paragraphs:
+        pieces = [paragraph[index:index + chunk_size]
+                  for index in range(0, len(paragraph), chunk_size)] or ['']
+        for piece in pieces:
+            if current and current_size + len(piece) > chunk_size:
+                chunks.append('\n\n'.join(current))
+                current = []
+                current_size = 0
+            current.append(piece)
+            current_size += len(piece) + 2
+    if current:
+        chunks.append('\n\n'.join(current))
+    if not chunks:
+        chunks = [content]
+    if len(chunks) > max_chunks:
+        indexes = [round(i * (len(chunks) - 1) / (max_chunks - 1))
+                   for i in range(max_chunks)]
+        chunks = [chunks[index] for index in indexes]
+    return chunks
+
+
+def _normalize_material_generation(result, question_count, difficulty):
+    if not isinstance(result, dict):
+        raise ValueError('AI 返回内容不是 JSON 对象')
+    summary = str(result.get('summary', '')).strip()
+    if not summary:
+        raise ValueError('AI 返回内容缺少总结')
+
+    knowledge_points = []
+    for item in result.get('knowledge_points', [])[:20]:
+        if isinstance(item, dict):
+            name = str(item.get('name', '')).strip()[:120]
+            description = str(item.get('description', '')).strip()[:500]
+        else:
+            name = str(item).strip()[:120]
+            description = ''
+        if name:
+            knowledge_points.append({'name': name, 'description': description})
+
+    type_aliases = {
+        'multiple_choice': 'choice', '选择题': 'choice',
+        '判断题': 'true_false', 'boolean': 'true_false',
+        '填空题': 'fill_blank', 'fill': 'fill_blank',
+        '简答题': 'short_answer', 'subjective': 'short_answer',
+    }
+    questions = []
+    for item in result.get('questions', []):
+        if not isinstance(item, dict):
+            continue
+        content = str(item.get('content', '')).strip()[:3000]
+        answer = str(item.get('answer', '')).strip()[:2000]
+        if not content or not answer:
+            continue
+        qtype = type_aliases.get(str(item.get('type', '')).strip(),
+                                 str(item.get('type', '')).strip())
+        if qtype not in ('choice', 'true_false', 'fill_blank', 'short_answer'):
+            qtype = 'short_answer'
+        options = item.get('options')
+        if isinstance(options, list):
+            options = {chr(65 + i): str(value) for i, value in enumerate(options[:4])}
+        if qtype == 'true_false':
+            options = {'A': '正确', 'B': '错误'}
+        elif qtype == 'choice' and not isinstance(options, dict):
+            qtype = 'short_answer'
+            options = None
+        elif qtype not in ('choice', 'true_false'):
+            options = None
+        try:
+            item_difficulty = int(item.get('difficulty', difficulty))
+        except (TypeError, ValueError):
+            item_difficulty = difficulty
+        questions.append({
+            'type': qtype,
+            'content': content,
+            'options': options,
+            'answer': answer,
+            'explanation': str(item.get('explanation', '')).strip()[:3000],
+            'difficulty': max(1, min(item_difficulty, 5)),
+            'score': 1 if qtype in ('choice', 'true_false', 'fill_blank') else 5,
+        })
+        if len(questions) >= question_count:
+            break
+    if not questions:
+        raise ValueError('AI 未生成有效题目')
+    return {
+        'title': str(result.get('title', '')).strip()[:300],
+        'summary': summary[:12000],
+        'knowledge_points': knowledge_points,
+        'questions': questions,
+    }
+
+
+@app.post('/api/ai/materials/generate')
+def generate_material_bank(req: AIMaterialGenerateReq):
+    """分析资料、生成题目并保存到独立 AI 资料题库。"""
+    if not DEEPSEEK_API_KEY:
+        raise HTTPException(400, 'DeepSeek API Key 未配置')
+    content = req.content.strip()
+    if len(content) < 30:
+        raise HTTPException(400, '资料文字过少，无法分析')
+    if len(content) > 150000:
+        raise HTTPException(400, '资料超过 15 万字符，请拆分后导入')
+    if not 1 <= req.question_count <= 10:
+        raise HTTPException(400, '生成题数应为 1-10')
+    if not 1 <= req.difficulty <= 5:
+        raise HTTPException(400, '难度应为 1-5')
+
+    type_names = {
+        'mixed': '混合题型（选择、判断、填空、简答合理搭配）',
+        'choice': '选择题', 'true_false': '判断题',
+        'fill_blank': '填空题', 'short_answer': '简答题',
+    }
+    requested_type = type_names.get(req.question_type, type_names['mixed'])
+    try:
+        if len(content) > 24000:
+            notes = []
+            chunks = _material_chunks(content)
+            for index, chunk in enumerate(chunks, 1):
+                note = _call_material_ai(
+                    '你是资料提炼助手。忠实提炼本段的关键事实、概念和逻辑，只返回文本摘要。',
+                    f'资料第 {index}/{len(chunks)} 段：\n{chunk}',
+                    max_tokens=1200, temperature=0.1
+                )
+                notes.append(f'【第{index}段提炼】\n{note.strip()}')
+            source = '\n\n'.join(notes)
+            source_label = '以下是长资料各段的忠实提炼结果'
+        else:
+            source = content
+            source_label = '以下是资料原文'
+
+        prompt = f"""科目：{req.subject or '通用'}
+文件名：{req.filename}
+需要生成：{req.question_count} 道{requested_type}
+目标难度：{req.difficulty}/5
+
+{source_label}：
+{source}
+
+请总结整份资料、提炼知识点并生成题目。"""
+        reply = _call_material_ai(
+            _MATERIAL_SYSTEM_PROMPT, prompt, max_tokens=6000, temperature=0.25
+        )
+        generated = _normalize_material_generation(
+            _extract_json_object(reply), req.question_count, req.difficulty
+        )
+        material_id = db_module.save_ai_material_generation(
+            req.user_id, req.subject, req.filename, req.file_type,
+            content, generated
+        )
+        material = db_module.get_ai_material(material_id, req.user_id)
+        return {'success': True, 'material': material}
+    except http_requests.Timeout:
+        raise HTTPException(504, 'AI 分析资料超时，请稍后重试')
+    except http_requests.RequestException as e:
+        raise HTTPException(502, f'AI 服务调用失败: {str(e)}')
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+        raise HTTPException(500, f'AI 返回格式异常: {str(e)}')
+    except Exception as e:
+        raise HTTPException(500, f'保存 AI 资料题库失败: {str(e)}')
+
+
+@app.get('/api/ai/materials')
+def list_material_banks(user_id: int, subject: Optional[str] = None,
+                        limit: int = 50):
+    return db_module.get_ai_materials(user_id, subject, limit)
+
+
+@app.get('/api/ai/materials/{material_id}')
+def get_material_bank(material_id: int, user_id: int):
+    material = db_module.get_ai_material(material_id, user_id)
+    if not material:
+        raise HTTPException(404, '资料题库不存在')
+    return material
+
+
+@app.delete('/api/ai/materials/{material_id}')
+def remove_material_bank(material_id: int, user_id: int):
+    if not db_module.delete_ai_material(material_id, user_id):
+        raise HTTPException(404, '资料题库不存在')
+    return {'success': True}
 
 @app.post('/api/ai/grade')
 def ai_grade(req: AIGradeReq):
