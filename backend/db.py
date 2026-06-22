@@ -256,6 +256,113 @@ def get_wrong_answers(user_id, limit=50, subject_id=None):
         conn.close()
 
 
+# ==================== AI 错因诊断模块 ====================
+
+def ensure_ai_diagnoses_table():
+    """为已有数据库补建 AI 诊断表，不要求用户重置数据库。"""
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS ai_diagnoses (
+                id BIGSERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                question_id BIGINT NOT NULL REFERENCES questions(id) ON DELETE CASCADE,
+                user_answer TEXT NOT NULL,
+                error_type VARCHAR(64) NOT NULL,
+                summary TEXT NOT NULL,
+                analysis TEXT NOT NULL DEFAULT '',
+                knowledge_gaps JSONB NOT NULL DEFAULT '[]'::jsonb,
+                suggestions JSONB NOT NULL DEFAULT '[]'::jsonb,
+                next_action TEXT NOT NULL DEFAULT '',
+                confidence FLOAT NOT NULL DEFAULT 0 CHECK (confidence BETWEEN 0 AND 1),
+                model VARCHAR(64) NOT NULL DEFAULT 'deepseek-chat',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_ai_diagnoses_user
+            ON ai_diagnoses(user_id, created_at DESC)
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_ai_diagnoses_question
+            ON ai_diagnoses(question_id, created_at DESC)
+        """)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+
+def save_ai_diagnosis(user_id, question_id, user_answer, diagnosis,
+                      model='deepseek-chat'):
+    """保存一次结构化错因诊断并返回记录 ID。"""
+    ensure_ai_diagnoses_table()
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO ai_diagnoses (
+                user_id, question_id, user_answer, error_type, summary,
+                analysis, knowledge_gaps, suggestions, next_action,
+                confidence, model
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
+        """, (
+            user_id, question_id, user_answer,
+            diagnosis['error_type'], diagnosis['summary'],
+            diagnosis.get('analysis', ''),
+            psycopg2.extras.Json(
+                diagnosis.get('knowledge_gaps', []),
+                dumps=lambda value: json.dumps(value, ensure_ascii=False)
+            ),
+            psycopg2.extras.Json(
+                diagnosis.get('suggestions', []),
+                dumps=lambda value: json.dumps(value, ensure_ascii=False)
+            ),
+            diagnosis.get('next_action', ''), diagnosis.get('confidence', 0),
+            model,
+        ))
+        diagnosis_id = cur.fetchone()[0]
+        conn.commit()
+        return diagnosis_id
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+
+def get_ai_diagnoses(user_id, question_id=None, limit=20):
+    """查询用户的历史错因诊断。"""
+    ensure_ai_diagnoses_table()
+    conn = get_conn()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+    try:
+        params = [user_id]
+        where = "WHERE d.user_id = %s"
+        if question_id is not None:
+            where += " AND d.question_id = %s"
+            params.append(question_id)
+        params.append(max(1, min(int(limit), 100)))
+        cur.execute(f"""
+            SELECT d.*, q.content AS question_content, q.type AS question_type
+            FROM ai_diagnoses d
+            JOIN questions q ON q.id = d.question_id
+            {where}
+            ORDER BY d.created_at DESC
+            LIMIT %s
+        """, params)
+        return [dict(row) for row in cur.fetchall()]
+    finally:
+        cur.close()
+        conn.close()
+
+
 # ==================== 笔记模块 ====================
 
 def save_note(user_id, question_id, content, note_type='text', image_path=None):

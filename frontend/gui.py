@@ -6,6 +6,8 @@ import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext, colorchooser
 import json
 import os
+import queue
+import threading
 from datetime import datetime
 from PIL import Image, ImageGrab, ImageTk
 from . import api_client as db_module
@@ -152,6 +154,7 @@ class PracticePanel:
         self.correct_count = 0
         self.total_score = 0
         self.answered = False
+        self.answer_states = {}
 
         self._build_ui()
 
@@ -213,6 +216,11 @@ class PracticePanel:
         self.bottom_frame = tk.Frame(self.parent, bg=COLOR_BG, pady=10)
         self.bottom_frame.pack(fill='x')
 
+        self.prev_btn = tk.Button(self.bottom_frame, text='上一题', font=FONT_NORMAL,
+                                  bg='#7f8c8d', fg=COLOR_WHITE, bd=0, padx=20, pady=6,
+                                  state='disabled', command=self._previous_question)
+        self.prev_btn.pack(side='left', padx=10)
+
         self.submit_btn = tk.Button(self.bottom_frame, text='提交答案', font=FONT_NORMAL,
                                     bg=COLOR_SUCCESS, fg=COLOR_WHITE, bd=0, padx=30, pady=6,
                                     state='disabled', command=self._submit_answer)
@@ -252,6 +260,7 @@ class PracticePanel:
             w.destroy()
         self.submit_btn.config(state='disabled')
         self.next_btn.config(state='disabled')
+        self.prev_btn.config(state='disabled')
 
     @staticmethod
     def _parse_options(options):
@@ -341,11 +350,13 @@ class PracticePanel:
         self.correct_count = 0
         self.total_score = 0
         self.answered = False
+        self.answer_states = {}
 
         self.practice_id = db_module.create_practice_record(self.user['id'])
 
         self.submit_btn.config(state='normal')
         self.next_btn.config(state='disabled')
+        self.prev_btn.config(state='disabled')
         self._show_current_question()
 
     def _get_current_q(self):
@@ -371,6 +382,11 @@ class PracticePanel:
 
         try:
             self._render_current_question()
+            q = self._get_current_q()
+            state = self.answer_states.get(q.get('id'))
+            if state:
+                self._restore_answer_state(q, state)
+            self._update_previous_button()
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -381,6 +397,44 @@ class PracticePanel:
                      bg=COLOR_WHITE, justify='left',
                      wraplength=600).pack(pady=40)
             self.submit_btn.config(state='disabled')
+
+    def _update_previous_button(self):
+        """根据当前位置更新上一题按钮。"""
+        if not self.current_questions:
+            self.prev_btn.config(state='disabled')
+            return
+        if self.current_index >= self.total_questions:
+            has_previous = self.total_questions > 0
+        else:
+            item = self.current_questions[self.current_index]
+            has_previous = self.current_index > 0 or (
+                item['is_composite'] and item.get('child_idx', 0) > 0
+            )
+        self.prev_btn.config(state='normal' if has_previous else 'disabled')
+
+    def _previous_question(self):
+        """上一题；支持复合题子题和练习完成页返回。"""
+        if not self.current_questions:
+            return
+        if self.current_index >= self.total_questions:
+            self.current_index = self.total_questions - 1
+            item = self.current_questions[self.current_index]
+            if item['is_composite']:
+                item['child_idx'] = len(item['children']) - 1
+            self._show_current_question()
+            return
+
+        item = self.current_questions[self.current_index]
+        if item['is_composite'] and item.get('child_idx', 0) > 0:
+            item['child_idx'] -= 1
+        elif self.current_index > 0:
+            self.current_index -= 1
+            previous_item = self.current_questions[self.current_index]
+            if previous_item['is_composite']:
+                previous_item['child_idx'] = len(previous_item['children']) - 1
+        else:
+            return
+        self._show_current_question()
 
     def _debug_question_data(self, q, label='题目'):
         """调试输出题目数据结构（仅在控制台）"""
@@ -577,6 +631,104 @@ class PracticePanel:
             return None
         return False
 
+    def _restore_answer_state(self, q, state):
+        """恢复已答题目的输入、批改结果和 AI 诊断。"""
+        user_answer = state.get('user_answer', '')
+        self.answered = True
+        self.submit_btn.config(state='disabled')
+        self.next_btn.config(state='normal')
+
+        if q['type'] in ('careful_reading_question', 'banked_cloze_blank',
+                         'long_reading_question', 'cs_choice'):
+            self.answer_var.set(user_answer)
+            for button in getattr(self, 'option_buttons', []):
+                button.config(state='disabled')
+        elif q['type'] in ('translation', 'cs_comprehensive'):
+            self.fill_entry.insert('1.0', user_answer)
+            self.fill_entry.config(state='disabled')
+        elif q['type'] == 'writing':
+            self.essay_text.insert('1.0', user_answer)
+            self.essay_text.config(state='disabled')
+
+        for widget in self.result_frame.winfo_children():
+            widget.destroy()
+        is_correct = state.get('is_correct')
+        if is_correct is True:
+            text = '✓ 已回答正确'
+            color = COLOR_SUCCESS
+        elif is_correct is False:
+            text = '✗ 已回答错误'
+            color = COLOR_DANGER
+        else:
+            score = state.get('score', 0)
+            text = f'已完成作答 · 得分 {score}'
+            color = COLOR_ACCENT
+        tk.Label(
+            self.result_frame, text=text, font=('Microsoft YaHei', 11, 'bold'),
+            fg=color, bg=COLOR_BG
+        ).pack(side='left', padx=10)
+
+        if is_correct is False:
+            self._show_answer_feedback(q, user_answer)
+            self._show_saved_ai_diagnosis(q, state)
+        elif is_correct is None:
+            if state.get('score_pending'):
+                self.next_btn.config(state='disabled')
+                self._show_essay_scoring(q, user_answer, q.get('score', 15))
+                return
+            history_frame = tk.Frame(
+                self.scrollable_frame, bg='#fef9e7', bd=1,
+                relief='groove', padx=15, pady=8
+            )
+            history_frame.pack(fill='x', padx=15, pady=5)
+            tk.Label(
+                history_frame, text='【你的作答】',
+                font=('Microsoft YaHei', 10, 'bold'),
+                fg='#7d6608', bg='#fef9e7'
+            ).pack(anchor='w')
+            tk.Label(
+                history_frame, text=user_answer, font=FONT_SMALL,
+                fg=COLOR_PRIMARY, bg='#fef9e7', wraplength=630,
+                justify='left'
+            ).pack(anchor='w', pady=3)
+            self._show_answer_feedback(q, user_answer)
+
+    def _show_saved_ai_diagnosis(self, q, state):
+        """展示缓存诊断；缓存没有时从数据库读取最近一次匹配记录。"""
+        diagnosis = state.get('diagnosis')
+        if not diagnosis and state.get('diagnosis_status') != 'loading':
+            records = db_module.get_ai_diagnoses(
+                self.user['id'], question_id=q['id'], limit=5
+            )
+            diagnosis = next((
+                item for item in records
+                if str(item.get('user_answer', '')).strip() ==
+                str(state.get('user_answer', '')).strip()
+            ), records[0] if records else None)
+            if diagnosis:
+                state['diagnosis'] = diagnosis
+                state['diagnosis_status'] = 'done'
+
+        frame = tk.Frame(
+            self.scrollable_frame, bg='#f5eef8', bd=1,
+            relief='groove', padx=15, pady=10
+        )
+        frame.pack(fill='x', padx=15, pady=5)
+        if diagnosis:
+            self._render_ai_diagnosis(frame, diagnosis)
+        elif state.get('diagnosis_status') == 'loading':
+            tk.Label(
+                frame, text='🤖 AI 仍在分析这次错误，稍后再返回即可查看',
+                font=FONT_SMALL, fg='#8e44ad', bg='#f5eef8'
+            ).pack(anchor='w')
+        else:
+            error = state.get('diagnosis_error') or '暂未生成诊断'
+            tk.Label(
+                frame, text=f'AI 错因诊断：{error}',
+                font=FONT_SMALL, fg='#7f8c8d', bg='#f5eef8',
+                wraplength=640, justify='left'
+            ).pack(anchor='w')
+
     def _submit_answer(self):
         """提交答案"""
         if self.answered:
@@ -594,6 +746,16 @@ class PracticePanel:
 
         # 批改
         is_correct = self._grade_answer(q, user_answer)
+        answer_state = {
+            'user_answer': user_answer,
+            'is_correct': is_correct,
+            'score': 0,
+            'diagnosis': None,
+            'diagnosis_status': '',
+            'diagnosis_error': '',
+            'score_pending': q['type'] in ('writing', 'translation', 'cs_comprehensive'),
+        }
+        self.answer_states[q['id']] = answer_state
 
         # 显示结果
         for w in self.result_frame.winfo_children():
@@ -625,6 +787,9 @@ class PracticePanel:
                 ai_result = db_module.ai_grade(grade_data)
                 if ai_result:
                     ai_score, ai_feedback = ai_result
+                    answer_state['score'] = ai_score
+                    answer_state['feedback'] = ai_feedback
+                    answer_state['score_pending'] = False
                     self.total_score += ai_score
                     db_module.update_answer_score(self.user['id'], q['id'], ai_score, self.practice_id)
                     self._show_ai_scoring(q, user_answer, ai_score, max_score, ai_feedback)
@@ -643,6 +808,7 @@ class PracticePanel:
             result_text = '✓ 回答正确！'
             self.correct_count += 1
             actual_score = q.get('score', 0) or 0
+            answer_state['score'] = actual_score
             self.total_score += actual_score
 
             db_module.save_answer_record(
@@ -659,6 +825,7 @@ class PracticePanel:
             result_color = COLOR_DANGER
             result_text = '✗ 回答错误'
             actual_score = 0
+            answer_state['score'] = 0
 
             db_module.save_answer_record(
                 self.user['id'], q['id'], user_answer,
@@ -671,13 +838,16 @@ class PracticePanel:
                                     fg=result_color, bg=COLOR_BG)
             result_label.pack(side='left', padx=10)
             self._show_answer_feedback(q, user_answer)
+            self._start_ai_diagnosis(q, user_answer)
 
         # 更新进度
         self.progress_label.config(
             text=f'第 {self.current_index + 1}/{self.total_questions} 题  |  正确: {self.correct_count}  |  得分: {self.total_score}')
 
         # 启用下一题按钮
-        self.next_btn.config(state='normal')
+        self.next_btn.config(
+            state='disabled' if answer_state.get('score_pending') else 'normal'
+        )
 
     def _show_answer_feedback(self, q, user_answer):
         """显示答题反馈"""
@@ -710,6 +880,147 @@ class PracticePanel:
         # 滚动到底部看到反馈
         self.scrollable_frame.update_idletasks()
         self.canvas.yview_moveto(1)
+
+    def _start_ai_diagnosis(self, q, user_answer):
+        """在后台请求 AI 错因诊断，并在当前题目下展示结果。"""
+        state = self.answer_states.setdefault(q['id'], {
+            'user_answer': user_answer, 'is_correct': False, 'score': 0
+        })
+        state['diagnosis_status'] = 'loading'
+        state['diagnosis_error'] = ''
+        diagnosis_frame = tk.Frame(
+            self.scrollable_frame, bg='#f5eef8', bd=1,
+            relief='groove', padx=15, pady=10
+        )
+        diagnosis_frame.pack(fill='x', padx=15, pady=5)
+        tk.Label(
+            diagnosis_frame, text='🤖 AI 正在分析这次错误...',
+            font=('Microsoft YaHei', 11, 'bold'),
+            fg='#8e44ad', bg='#f5eef8'
+        ).pack(anchor='w')
+        tk.Label(
+            diagnosis_frame, text='可以继续操作，诊断完成后会自动显示',
+            font=FONT_SMALL, fg='#7f8c8d', bg='#f5eef8'
+        ).pack(anchor='w', pady=(3, 0))
+
+        result_queue = queue.Queue(maxsize=1)
+
+        def worker():
+            result = db_module.ai_diagnose(
+                self.user['id'], q['id'], user_answer,
+                subject=getattr(self, 'subject', '')
+            )
+            result_queue.put(result)
+
+        def poll_result():
+            try:
+                diagnosis, error = result_queue.get_nowait()
+            except queue.Empty:
+                try:
+                    if self.parent.winfo_exists():
+                        self.parent.after(120, poll_result)
+                except tk.TclError:
+                    pass
+                return
+
+            if self.answer_states.get(q['id']) is not state:
+                return
+            state['diagnosis'] = diagnosis
+            state['diagnosis_status'] = 'done' if diagnosis else 'error'
+            state['diagnosis_error'] = error
+            try:
+                frame_exists = bool(diagnosis_frame.winfo_exists())
+            except tk.TclError:
+                return
+            if not frame_exists:
+                try:
+                    current_q = self._get_current_q()
+                except (IndexError, KeyError):
+                    return
+                if current_q.get('id') == q.get('id'):
+                    self._show_current_question()
+                return
+
+            for widget in diagnosis_frame.winfo_children():
+                widget.destroy()
+            if diagnosis:
+                self._render_ai_diagnosis(diagnosis_frame, diagnosis)
+            else:
+                tk.Label(
+                    diagnosis_frame,
+                    text=f'AI 错因诊断暂不可用：{error or "未知错误"}',
+                    font=FONT_SMALL, fg=COLOR_DANGER, bg='#f5eef8',
+                    wraplength=650, justify='left'
+                ).pack(anchor='w')
+            self.scrollable_frame.update_idletasks()
+
+        threading.Thread(target=worker, daemon=True).start()
+        self.parent.after(120, poll_result)
+        self.scrollable_frame.update_idletasks()
+        self.canvas.yview_moveto(1)
+
+    def _render_ai_diagnosis(self, parent, diagnosis):
+        """渲染结构化诊断结果。"""
+        header = tk.Frame(parent, bg='#f5eef8')
+        header.pack(fill='x')
+        tk.Label(
+            header, text='🤖 AI 错因诊断',
+            font=('Microsoft YaHei', 11, 'bold'),
+            fg='#8e44ad', bg='#f5eef8'
+        ).pack(side='left')
+        confidence = float(diagnosis.get('confidence', 0) or 0) * 100
+        tk.Label(
+            header,
+            text=f'{diagnosis.get("error_type", "其他")} · 置信度 {confidence:.0f}%',
+            font=FONT_SMALL, fg='#7d3c98', bg='#eadcf0',
+            padx=8, pady=2
+        ).pack(side='right')
+
+        tk.Label(
+            parent, text=diagnosis.get('summary', ''),
+            font=('Microsoft YaHei', 10, 'bold'),
+            fg=COLOR_PRIMARY, bg='#f5eef8',
+            wraplength=640, justify='left'
+        ).pack(anchor='w', pady=(8, 4))
+
+        analysis = diagnosis.get('analysis', '')
+        if analysis:
+            tk.Label(
+                parent, text=f'原因分析：{analysis}',
+                font=FONT_SMALL, fg=COLOR_PRIMARY, bg='#f5eef8',
+                wraplength=640, justify='left'
+            ).pack(anchor='w', pady=2)
+
+        gaps = diagnosis.get('knowledge_gaps') or []
+        if gaps:
+            tk.Label(
+                parent, text=f'薄弱知识点：{"、".join(gaps)}',
+                font=FONT_SMALL, fg=COLOR_WARNING, bg='#f5eef8',
+                wraplength=640, justify='left'
+            ).pack(anchor='w', pady=2)
+
+        suggestions = diagnosis.get('suggestions') or []
+        if suggestions:
+            tk.Label(
+                parent, text='改进建议：',
+                font=('Microsoft YaHei', 9, 'bold'),
+                fg=COLOR_SUCCESS, bg='#f5eef8'
+            ).pack(anchor='w', pady=(5, 0))
+            for index, suggestion in enumerate(suggestions, 1):
+                tk.Label(
+                    parent, text=f'{index}. {suggestion}',
+                    font=FONT_SMALL, fg=COLOR_PRIMARY, bg='#f5eef8',
+                    wraplength=620, justify='left'
+                ).pack(anchor='w', padx=(12, 0), pady=1)
+
+        next_action = diagnosis.get('next_action', '')
+        if next_action:
+            tk.Label(
+                parent, text=f'下一步：{next_action}',
+                font=('Microsoft YaHei', 9, 'bold'),
+                fg=COLOR_ACCENT, bg='#f5eef8',
+                wraplength=640, justify='left'
+            ).pack(anchor='w', pady=(6, 0))
 
     def _show_essay_scoring(self, q, user_answer, max_score):
         """作文评分界面：显示参考范文 + 自评分数输入"""
@@ -798,6 +1109,10 @@ class PracticePanel:
 
         # 累加分数
         self.total_score += score
+        if q.get('id') in self.answer_states:
+            self.answer_states[q['id']]['score'] = score
+            self.answer_states[q['id']]['score_pending'] = False
+        self.next_btn.config(state='normal')
 
         # 更新进度显示
         self.progress_label.config(
@@ -917,6 +1232,7 @@ class PracticePanel:
             w.destroy()
         self.submit_btn.config(state='disabled')
         self.next_btn.config(state='disabled')
+        self.prev_btn.config(state='normal' if self.total_questions > 0 else 'disabled')
 
         # 完成练习记录（按独立小题数统计）
         indiv_total = self.total_indiv if hasattr(self, 'total_indiv') else self.total_questions
@@ -1021,6 +1337,10 @@ class WrongAnswerPanel:
                      font=FONT_NORMAL, fg='#7f8c8d', bg=COLOR_WHITE).pack(pady=50)
             return
 
+        latest_diagnoses = {}
+        for diagnosis in db_module.get_ai_diagnoses(self.user['id'], limit=100):
+            latest_diagnoses.setdefault(diagnosis.get('question_id'), diagnosis)
+
         for item in wrong_answers:
             card = tk.Frame(self.scrollable_frame, bg=COLOR_BG, bd=1,
                             relief='groove', padx=15, pady=10)
@@ -1042,6 +1362,36 @@ class WrongAnswerPanel:
                 tk.Label(detail_frame, text=f'解析: {item.get("explanation", "")}',
                          font=FONT_SMALL, fg='#7f8c8d', bg=COLOR_BG,
                          wraplength=600, justify='left').pack(anchor='w', pady=2)
+
+            diagnosis = latest_diagnoses.get(item.get('question_id'))
+            if diagnosis:
+                ai_frame = tk.Frame(card, bg='#f5eef8', bd=1,
+                                    relief='groove', padx=10, pady=6)
+                ai_frame.pack(fill='x', pady=(5, 6))
+                tk.Label(
+                    ai_frame,
+                    text=f'🤖 最近诊断 · {diagnosis.get("error_type", "其他")}',
+                    font=('Microsoft YaHei', 9, 'bold'),
+                    fg='#8e44ad', bg='#f5eef8'
+                ).pack(anchor='w')
+                tk.Label(
+                    ai_frame, text=diagnosis.get('summary', ''),
+                    font=FONT_SMALL, fg=COLOR_PRIMARY, bg='#f5eef8',
+                    wraplength=580, justify='left'
+                ).pack(anchor='w', pady=2)
+                gaps = diagnosis.get('knowledge_gaps') or []
+                if gaps:
+                    tk.Label(
+                        ai_frame, text=f'薄弱知识点：{"、".join(gaps)}',
+                        font=FONT_SMALL, fg=COLOR_WARNING, bg='#f5eef8',
+                        wraplength=580, justify='left'
+                    ).pack(anchor='w')
+                if diagnosis.get('next_action'):
+                    tk.Label(
+                        ai_frame, text=f'下一步：{diagnosis["next_action"]}',
+                        font=FONT_SMALL, fg=COLOR_ACCENT, bg='#f5eef8',
+                        wraplength=580, justify='left'
+                    ).pack(anchor='w')
 
             # 操作按钮
             btn_frame = tk.Frame(card, bg=COLOR_BG)

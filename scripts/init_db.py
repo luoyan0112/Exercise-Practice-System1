@@ -21,7 +21,7 @@ def drop_all_tables():
     cur.execute("SET session_replication_role = 'replica';")
 
     tables = [
-        'user_knowledge_progress', 'user_notes', 'answer_records',
+        'ai_diagnoses', 'user_knowledge_progress', 'user_notes', 'answer_records',
         'practice_records', 'question_knowledge', 'questions',
         'knowledge_points', 'users', 'subjects', 'dict_question_types'
     ]
@@ -171,6 +171,25 @@ def init_database():
     );
     """)
 
+    # ========== 12. AI 错因诊断表 ==========
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS ai_diagnoses (
+        id BIGSERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        question_id BIGINT NOT NULL REFERENCES questions(id) ON DELETE CASCADE,
+        user_answer TEXT NOT NULL,
+        error_type VARCHAR(64) NOT NULL,
+        summary TEXT NOT NULL,
+        analysis TEXT NOT NULL DEFAULT '',
+        knowledge_gaps JSONB NOT NULL DEFAULT '[]'::jsonb,
+        suggestions JSONB NOT NULL DEFAULT '[]'::jsonb,
+        next_action TEXT NOT NULL DEFAULT '',
+        confidence FLOAT NOT NULL DEFAULT 0 CHECK (confidence BETWEEN 0 AND 1),
+        model VARCHAR(64) NOT NULL DEFAULT 'deepseek-chat',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    """)
+
     # ========== 索引 ==========
     cur.execute("CREATE INDEX IF NOT EXISTS idx_questions_parent_id ON questions(parent_id);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_questions_type ON questions(type);")
@@ -180,6 +199,8 @@ def init_database():
     cur.execute("CREATE INDEX IF NOT EXISTS idx_answer_records_user ON answer_records(user_id);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_answer_records_question ON answer_records(question_id);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_user_notes_user ON user_notes(user_id);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_ai_diagnoses_user ON ai_diagnoses(user_id, created_at DESC);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_ai_diagnoses_question ON ai_diagnoses(question_id, created_at DESC);")
 
     # ========== 自动更新时间触发器 ==========
     cur.execute("""

@@ -118,6 +118,13 @@ python main.py
 | `finish_practice_record` | practice_id, total, correct, score | None | 完成会话 |
 | `get_wrong_answers` | user_id, limit | `list[dict]` | 错题列表 |
 
+##### AI 错因诊断模块
+
+| 函数 | 参数 | 返回值 | 说明 |
+|------|------|--------|------|
+| `save_ai_diagnosis` | user_id, question_id, user_answer, diagnosis | int | 保存结构化诊断并返回记录 ID |
+| `get_ai_diagnoses` | user_id, question_id, limit | `list[dict]` | 查询历史错因诊断 |
+
 ##### 笔记模块
 | 函数 | 参数 | 返回值 | 说明 |
 |------|------|--------|------|
@@ -153,14 +160,21 @@ python main.py
 | POST | `/api/knowledge-progress` | 更新知识点进度 |
 | GET | `/api/notebook-pages` | 笔记本页面列表 |
 | POST/PUT/DELETE | `/api/notebook-pages` | 笔记本页面 CRUD |
+| POST | `/api/ai/diagnose` | 分析客观题错因并持久化 |
+| GET | `/api/ai/diagnoses` | 查询用户历史错因诊断 |
 
 ---
 
 ### frontend/ — 前端 GUI
 
-#### gui.py（~2300行）— GUI 主程序
+#### gui.py（~3200行）— GUI 主程序
 
 完整的 tkinter GUI 应用程序，包含登录、刷题、错题本、笔记本、数据分析。
+
+客观题答错后会在后台调用 DeepSeek，展示错误类型、原因分析、薄弱知识点、
+改进建议、下一步行动和诊断置信度。诊断会保存到数据库，并在错题本显示最近一次结果。
+练习区支持“上一题/下一题”双向导航；返回已答题目时会恢复原答案、批改结果和 AI 诊断，
+并锁定已提交答案以防止重复计分。复合题可以在各子题之间双向切换。
 
 **全局常量：** `FONT_TITLE`, `FONT_NORMAL`, `FONT_SMALL`, `COLOR_PRIMARY`, `COLOR_ACCENT`, `COLOR_SUCCESS`, `COLOR_DANGER`, `COLOR_WARNING`, `COLOR_BG`, `COLOR_WHITE`
 
@@ -249,7 +263,7 @@ _save:
 
 建表 + 索引 + 触发器 + CET-6 示例数据。`--force` 参数可先删表重建。
 
-**11 张表：** `dict_question_types`, `subjects`, `knowledge_points`, `users`, `questions`, `question_knowledge`, `practice_records`, `answer_records`, `user_notes`, `user_knowledge_progress`
+**11 张表：** `dict_question_types`, `subjects`, `knowledge_points`, `users`, `questions`, `question_knowledge`, `practice_records`, `answer_records`, `user_notes`, `user_knowledge_progress`, `ai_diagnoses`
 
 **示例数据：** 2 篇写作、1 篇仔细阅读（4 选择）、1 篇选词填空（10 空）、1 篇长篇阅读（5 匹配）、2 道翻译
 
@@ -270,6 +284,7 @@ subjects ──┬── knowledge_points
 users ──┬── user_notes
         ├── practice_records
         ├── answer_records
+        ├── ai_diagnoses
         └── user_knowledge_progress ──┬── knowledge_points
 ```
 
@@ -302,6 +317,8 @@ python main.py
 | 问题 | 应查看的文件/位置 |
 |------|------------------|
 | 题目显示/批改逻辑 | `frontend/gui.py` → `PracticePanel._show_current_question`, `_submit_answer` |
+| AI 错因诊断界面 | `frontend/gui.py` → `PracticePanel._start_ai_diagnosis`, `_render_ai_diagnosis` |
+| AI 错因诊断接口 | `backend/server.py` → `ai_diagnose`; `backend/db.py` → `save_ai_diagnosis` |
 | 复合题子题分组 | `frontend/gui.py` → `PracticePanel._build_question_list` |
 | 子题翻页 | `frontend/gui.py` → `PracticePanel._next_question` |
 | 截图选区 | `frontend/gui.py` → `ScreenshotSelector` |

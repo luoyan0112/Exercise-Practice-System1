@@ -86,6 +86,12 @@ class AIGradeReq(BaseModel):
     explanation: Optional[str] = None
     max_score: float = 15
 
+class AIDiagnoseReq(BaseModel):
+    user_id: int
+    question_id: int
+    user_answer: str
+    subject: str = ''
+
 class NoteUpdateReq(BaseModel):
     user_id: int
     content: Optional[str] = None
@@ -348,6 +354,132 @@ _GRADE_SYSTEM_PROMPT = """你是一个评分助手。根据题目和参考答案
 2. 提供简短的评价反馈
 3. 用 JSON 格式返回：{"score": 分数, "feedback": "评价内容"}
 4. 只返回 JSON，不要有其他文字"""
+
+_DIAGNOSE_SYSTEM_PROMPT = """你是一名严谨、鼓励式的学习诊断导师。请根据题目、标准答案、解析和学生错误答案，判断学生为什么答错。
+要求：
+1. 诊断必须针对当前答案，不要泛泛讲解
+2. error_type 从以下类别中选择一个：知识点缺失、概念混淆、审题错误、推理错误、记忆错误、粗心错误、语言理解错误、其他
+3. knowledge_gaps 列出 0-4 个具体薄弱知识点
+4. suggestions 给出 1-4 条可以执行的复习建议
+5. confidence 是 0 到 1 之间的数字；证据不足时降低置信度
+6. 不要责备学生，不要编造题目之外的学习经历
+7. 只返回 JSON 对象，结构如下：
+{"error_type":"概念混淆","summary":"一句话结论","analysis":"具体分析","knowledge_gaps":["知识点"],"suggestions":["建议"],"next_action":"下一步练习建议","confidence":0.85}"""
+
+
+def _extract_json_object(reply: str):
+    """兼容纯 JSON 与 Markdown 代码块形式的模型返回。"""
+    text = reply.strip()
+    fence = chr(96) * 3
+    if text.startswith(fence):
+        text = text.split('\n', 1)[-1]
+        text = text.rsplit(fence, 1)[0].strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find('{')
+        end = text.rfind('}')
+        if start >= 0 and end > start:
+            return json.loads(text[start:end + 1])
+        raise
+
+
+def _normalize_text_list(value, max_items=4):
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip()[:200] for item in value[:max_items]
+            if str(item).strip()]
+
+
+def _normalize_diagnosis(result):
+    if not isinstance(result, dict):
+        raise ValueError('诊断结果不是 JSON 对象')
+    error_type = str(result.get('error_type', '其他')).strip()[:64] or '其他'
+    summary = str(result.get('summary', '')).strip()[:500]
+    analysis = str(result.get('analysis', '')).strip()[:2000]
+    next_action = str(result.get('next_action', '')).strip()[:500]
+    if not summary:
+        raise ValueError('诊断结果缺少 summary')
+    try:
+        confidence = float(result.get('confidence', 0))
+    except (TypeError, ValueError):
+        confidence = 0
+    return {
+        'error_type': error_type,
+        'summary': summary,
+        'analysis': analysis,
+        'knowledge_gaps': _normalize_text_list(result.get('knowledge_gaps')),
+        'suggestions': _normalize_text_list(result.get('suggestions')),
+        'next_action': next_action,
+        'confidence': max(0.0, min(confidence, 1.0)),
+    }
+
+
+@app.post('/api/ai/diagnose')
+def ai_diagnose(req: AIDiagnoseReq):
+    """诊断客观题错因并保存结构化结果。"""
+    if not DEEPSEEK_API_KEY:
+        raise HTTPException(400, 'DeepSeek API Key 未配置，请设置环境变量 DEEPSEEK_API_KEY（或创建 .env 文件）')
+    user_answer = req.user_answer.strip()
+    if not user_answer:
+        raise HTTPException(400, '用户答案不能为空')
+    question = db_module.get_question_by_id(req.question_id)
+    if not question:
+        raise HTTPException(404, '题目不存在')
+
+    options = question.get('options') or {}
+    if not isinstance(options, str):
+        options = json.dumps(options, ensure_ascii=False)
+    user_msg = f"""科目：{req.subject or '通用'}
+题型：{question.get('type', '')}
+题目：{question.get('content', '')}
+选项：{options or '无'}
+学生答案：{user_answer}
+标准答案：{question.get('answer', '')}
+题目解析：{question.get('explanation', '') or '无'}
+
+请分析这次错误最可能的原因，并给出具体改进建议。"""
+
+    try:
+        resp = http_requests.post(DEEPSEEK_API_URL, json={
+            'model': 'deepseek-chat',
+            'messages': [
+                {'role': 'system', 'content': _DIAGNOSE_SYSTEM_PROMPT},
+                {'role': 'user', 'content': user_msg},
+            ],
+            'temperature': 0.2,
+            'max_tokens': 1200,
+        }, headers={
+            'Authorization': f'Bearer {DEEPSEEK_API_KEY}',
+            'Content-Type': 'application/json',
+        }, timeout=60)
+        resp.raise_for_status()
+        reply = resp.json()['choices'][0]['message']['content']
+        diagnosis = _normalize_diagnosis(_extract_json_object(reply))
+        diagnosis_id = db_module.save_ai_diagnosis(
+            req.user_id, req.question_id, user_answer, diagnosis
+        )
+        return {
+            'success': True,
+            'diagnosis_id': diagnosis_id,
+            'diagnosis': diagnosis,
+        }
+    except http_requests.Timeout:
+        raise HTTPException(504, 'AI 诊断超时，请稍后重试')
+    except http_requests.RequestException as e:
+        raise HTTPException(502, f'AI 服务调用失败: {str(e)}')
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+        raise HTTPException(500, f'AI 诊断结果格式异常: {str(e)}')
+    except Exception as e:
+        raise HTTPException(500, f'保存 AI 诊断失败: {str(e)}')
+
+
+@app.get('/api/ai/diagnoses')
+def list_ai_diagnoses(user_id: int, question_id: Optional[int] = None,
+                      limit: int = 20):
+    return db_module.get_ai_diagnoses(user_id, question_id, limit)
 
 @app.post('/api/ai/grade')
 def ai_grade(req: AIGradeReq):

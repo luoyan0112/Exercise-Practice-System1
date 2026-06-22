@@ -26,9 +26,9 @@ def _get(url, **params):
         raise
 
 
-def _post(url, **data):
+def _post(url, _timeout=10, **data):
     try:
-        r = _session.post(f'{BASE_URL}{url}', json=data, timeout=10)
+        r = _session.post(f'{BASE_URL}{url}', json=data, timeout=_timeout)
         r.raise_for_status()
         return r.json()
     except requests.RequestException as e:
@@ -118,7 +118,7 @@ def switch_subject(name):
 def ai_generate_similar(question_data):
     """调用 AI 生成相似题目"""
     try:
-        data = _post('/api/ai/generate', **question_data)
+        data = _post('/api/ai/generate', _timeout=65, **question_data)
         if data.get('success'):
             return data.get('question')
         return None
@@ -135,7 +135,7 @@ def ai_generate_similar(question_data):
 def ai_grade(question_data):
     """调用 AI 对主观题答案评分，返回 (score, feedback) 或 None"""
     try:
-        data = _post('/api/ai/grade', **question_data)
+        data = _post('/api/ai/grade', _timeout=65, **question_data)
         if data.get('success'):
             return data.get('score'), data.get('feedback', '')
         return None
@@ -146,6 +146,39 @@ def ai_grade(question_data):
         else:
             print(f'AI 评分失败: {e}')
         return None
+
+
+def ai_diagnose(user_id, question_id, user_answer, subject=''):
+    """执行错因诊断，返回 (diagnosis, error_message)。"""
+    try:
+        data = _post(
+            '/api/ai/diagnose', _timeout=65,
+            user_id=user_id, question_id=question_id,
+            user_answer=user_answer, subject=subject,
+        )
+        if data.get('success'):
+            return data.get('diagnosis'), ''
+        return None, 'AI 未返回诊断结果'
+    except Exception as e:
+        resp = getattr(e, 'response', None)
+        if resp is not None:
+            try:
+                detail = resp.json().get('detail', '诊断失败')
+            except ValueError:
+                detail = '诊断失败'
+            return None, detail
+        return None, f'连接 AI 诊断服务失败: {e}'
+
+
+def get_ai_diagnoses(user_id, question_id=None, limit=20):
+    """获取已保存的 AI 错因诊断记录。"""
+    try:
+        params = {'user_id': user_id, 'limit': limit}
+        if question_id is not None:
+            params['question_id'] = question_id
+        return _get('/api/ai/diagnoses', **params)
+    except Exception:
+        return []
 
 
 # ==================== 题目模块 ====================
